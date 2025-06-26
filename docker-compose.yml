@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  nginx:
+    build: ./nginx-logs
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx-logs/logs:/var/log/nginx
+
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./nginx-logs/logs:/app/nginx-logs/logs
+    depends_on:
+      - nginx
+    networks:
+      - autosre-network
+
+networks:
+  autosre-network:
+    driver: bridge
+
+volumes:
+  ollama_data:
