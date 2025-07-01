@@ -19,25 +19,52 @@ interface LogAnalysis {
 }
 
 interface WebSocketMessage {
-  type: "initial_data" | "update" | "error" | "summary_update";
+  type: "initial_data" | "update" | "error";
   logs?: string;
   analysis?: LogAnalysis;
   error_logs?: string[];
-  summary?: string;
   message?: string;
   timestamp?: string;
+  alerts?: any[];
 }
 
 const Dashboard: React.FC = () => {
   const [logs, setLogs] = useState<string>("");
   const [analysis, setAnalysis] = useState<LogAnalysis | null>(null);
   const [errorLogs, setErrorLogs] = useState<string[]>([]);
-  const [summary, setSummary] = useState<string>("");
+  const [systemMetrics, setSystemMetrics] = useState<any>(null);
+  const [alerts, setAlerts] = useState<any[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<
     "connecting" | "connected" | "disconnected"
   >("disconnected");
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectAttempts = useRef(0);
+  const maxReconnectAttempts = 5;
+  const heartbeatInterval = useRef<number | null>(null);
+  const isComponentMounted = useRef(true);
+
+  // Fetch system metrics
+  const fetchSystemMetrics = async () => {
+    try {
+      const backendUrl =
+        import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+      const response = await fetch(`${backendUrl}/api/metrics`);
+      if (response.ok) {
+        const metrics = await response.json();
+        setSystemMetrics(metrics);
+      }
+    } catch (error) {
+      console.error("Failed to fetch system metrics:", error);
+    }
+  };
+
+  // Fetch metrics every 30 seconds
+  useEffect(() => {
+    fetchSystemMetrics();
+    const interval = setInterval(fetchSystemMetrics, 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   const connectWebSocket = () => {
     // Prevent multiple connection attempts
@@ -51,18 +78,32 @@ const Dashboard: React.FC = () => {
       console.log(
         "WebSocket: Closing existing connection before reconnecting."
       );
-      wsRef.current.close();
+      wsRef.current.close(1000, "Reconnecting");
+      wsRef.current = null;
     }
 
     setConnectionStatus("connecting");
     console.log("WebSocket: Attempting to connect...");
 
-    // Connect to localhost:8000 since frontend runs locally and backend runs in Docker
-    const ws = new WebSocket("ws://localhost:8000/ws");
+    // Get backend URL from environment variable or use default
+    const backendUrl =
+      import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+    const wsUrl = backendUrl.replace("http", "ws");
+
+    // Connect to backend WebSocket
+    const ws = new WebSocket(`${wsUrl}/ws`);
 
     ws.onopen = () => {
       console.log("WebSocket connected");
       setConnectionStatus("connected");
+      reconnectAttempts.current = 0; // Reset reconnection attempts on successful connection
+
+      // Start heartbeat to keep connection alive
+      heartbeatInterval.current = window.setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ping" }));
+        }
+      }, 30000); // Send ping every 30 seconds
     };
 
     ws.onmessage = (event) => {
@@ -75,17 +116,13 @@ const Dashboard: React.FC = () => {
             if (data.logs) setLogs(data.logs);
             if (data.analysis) setAnalysis(data.analysis);
             if (data.error_logs) setErrorLogs(data.error_logs);
-            if (data.summary) setSummary(data.summary);
+            if (data.alerts) setAlerts(data.alerts);
             setLastUpdated(new Date());
             break;
 
           case "update":
             if (data.analysis) setAnalysis(data.analysis);
-            setLastUpdated(new Date());
-            break;
-
-          case "summary_update":
-            if (data.summary) setSummary(data.summary);
+            if (data.alerts) setAlerts(data.alerts);
             setLastUpdated(new Date());
             break;
 
@@ -101,23 +138,52 @@ const Dashboard: React.FC = () => {
     ws.onclose = (event) => {
       console.log("WebSocket: Disconnected", event.code, event.reason);
       setConnectionStatus("disconnected");
+      wsRef.current = null;
 
-      // Only attempt reconnection if the close wasn't intentional
-      if (event.code !== 1000) {
-        // Try to reconnect after 5 seconds
+      // Clear heartbeat interval
+      if (heartbeatInterval.current) {
+        clearInterval(heartbeatInterval.current);
+        heartbeatInterval.current = null;
+      }
+
+      // Don't reconnect for intentional closes (1000) or going away (1001)
+      if (event.code === 1000 || event.code === 1001) {
+        console.log("WebSocket: Intentional close, not reconnecting");
+        return;
+      }
+
+      // Only attempt reconnection for unexpected disconnections and if component is still mounted
+      if (
+        reconnectAttempts.current < maxReconnectAttempts &&
+        isComponentMounted.current
+      ) {
+        reconnectAttempts.current += 1;
+        const delay = Math.min(5000 * reconnectAttempts.current, 30000); // Exponential backoff, max 30s
+
+        console.log(
+          `WebSocket: Attempting to reconnect (${reconnectAttempts.current}/${maxReconnectAttempts}) in ${delay}ms...`
+        );
+
         setTimeout(() => {
-          // Check if we're still disconnected before attempting reconnection
-          if (connectionStatus === "disconnected") {
-            console.log("WebSocket: Attempting to reconnect...");
+          // Only reconnect if we're still in disconnected state and component is mounted
+          if (
+            connectionStatus === "disconnected" &&
+            !wsRef.current &&
+            isComponentMounted.current
+          ) {
             connectWebSocket();
           }
-        }, 5000);
+        }, delay);
+      } else {
+        console.error(
+          "WebSocket: Max reconnection attempts reached, giving up"
+        );
       }
     };
 
     ws.onerror = (error) => {
       console.error("WebSocket: Error event", error);
-      setConnectionStatus("disconnected");
+      // Don't set disconnected status here, let onclose handle it
     };
 
     wsRef.current = ws;
@@ -125,16 +191,39 @@ const Dashboard: React.FC = () => {
 
   useEffect(() => {
     console.log("Dashboard mounted, connecting WebSocket...");
+
+    // Set component as mounted
+    isComponentMounted.current = true;
+
+    // Clean up any existing connections first
+    if (wsRef.current) {
+      wsRef.current.close(1000, "Component remounting");
+      wsRef.current = null;
+    }
+
+    // Reset reconnection attempts
+    reconnectAttempts.current = 0;
+
+    // Connect to WebSocket
     connectWebSocket();
 
     return () => {
+      // Set component as unmounted
+      isComponentMounted.current = false;
+
+      // Clear heartbeat interval
+      if (heartbeatInterval.current) {
+        clearInterval(heartbeatInterval.current);
+        heartbeatInterval.current = null;
+      }
+
       if (wsRef.current) {
         console.log("Dashboard unmounting, closing WebSocket...");
         wsRef.current.close(1000, "Component unmounting");
         wsRef.current = null;
       }
     };
-  }, []);
+  }, []); // Empty dependency array to run only once
 
   const parseLogLine = (line: string): LogEntry | null => {
     const regex =
@@ -393,39 +482,191 @@ const Dashboard: React.FC = () => {
             </div>
           </div>
 
-          {/* AI Analysis */}
+          {/* System Metrics */}
           <div className="bg-white rounded-lg shadow">
             <div className="px-6 py-4 border-b border-gray-200">
-              <h3 className="text-lg font-medium text-gray-900">AI Analysis</h3>
+              <h3 className="text-lg font-medium text-gray-900">
+                System Metrics
+              </h3>
             </div>
             <div className="p-6">
-              {summary ? (
-                <div className="prose prose-sm max-w-none">
-                  <div className="whitespace-pre-wrap text-gray-700">
-                    {summary}
+              <div className="grid grid-cols-2 gap-6">
+                {/* Uptime */}
+                <div className="text-center">
+                  <div className="p-3 bg-blue-100 rounded-lg">
+                    <svg
+                      className="w-8 h-8 text-blue-600 mx-auto mb-2"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                      />
+                    </svg>
+                    <div className="text-2xl font-bold text-blue-600">
+                      {systemMetrics?.uptime
+                        ? `${systemMetrics.uptime.hours}h ${systemMetrics.uptime.minutes}m`
+                        : "Loading..."}
+                    </div>
+                    <div className="text-sm text-gray-600">Uptime</div>
                   </div>
                 </div>
-              ) : (
-                <div className="text-gray-500 text-center py-8">
-                  <svg
-                    className="mx-auto h-12 w-12 text-gray-400"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"
-                    />
-                  </svg>
-                  <p className="mt-2">No analysis available</p>
+
+                {/* Memory Usage */}
+                <div className="text-center">
+                  <div className="p-3 bg-green-100 rounded-lg">
+                    <svg
+                      className="w-8 h-8 text-green-600 mx-auto mb-2"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"
+                      />
+                    </svg>
+                    <div className="text-2xl font-bold text-green-600">
+                      {systemMetrics?.memory
+                        ? `${systemMetrics.memory.usage_percent.toFixed(1)}%`
+                        : "Loading..."}
+                    </div>
+                    <div className="text-sm text-gray-600">Memory Usage</div>
+                  </div>
                 </div>
-              )}
+
+                {/* CPU Usage */}
+                <div className="text-center">
+                  <div className="p-3 bg-yellow-100 rounded-lg">
+                    <svg
+                      className="w-8 h-8 text-yellow-600 mx-auto mb-2"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"
+                      />
+                    </svg>
+                    <div className="text-2xl font-bold text-yellow-600">
+                      {systemMetrics?.cpu
+                        ? `${systemMetrics.cpu.usage_percent.toFixed(1)}%`
+                        : "Loading..."}
+                    </div>
+                    <div className="text-sm text-gray-600">CPU Usage</div>
+                  </div>
+                </div>
+
+                {/* Active Connections */}
+                <div className="text-center">
+                  <div className="p-3 bg-purple-100 rounded-lg">
+                    <svg
+                      className="w-8 h-8 text-purple-600 mx-auto mb-2"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"
+                      />
+                    </svg>
+                    <div className="text-2xl font-bold text-purple-600">
+                      {systemMetrics?.active_connections || "Loading..."}
+                    </div>
+                    <div className="text-sm text-gray-600">
+                      Active Connections
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* System Status */}
+              <div className="mt-6 p-4 bg-gray-50 rounded-lg">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center">
+                    <div className="w-3 h-3 bg-green-500 rounded-full mr-3"></div>
+                    <span className="text-sm font-medium text-gray-900">
+                      All Systems Operational
+                    </span>
+                  </div>
+                  <span className="text-xs text-gray-500">
+                    Last updated: {new Date().toLocaleTimeString()}
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
+
+        {/* Alerts Section */}
+        {alerts.length > 0 && (
+          <div className="mt-8 bg-white rounded-lg shadow">
+            <div className="px-6 py-4 border-b border-gray-200">
+              <h3 className="text-lg font-medium text-gray-900">
+                Active Alerts ({alerts.length})
+              </h3>
+            </div>
+            <div className="overflow-hidden">
+              <div className="max-h-64 overflow-y-auto">
+                {alerts.map((alert) => (
+                  <div
+                    key={alert.id}
+                    className={`px-6 py-4 border-b border-gray-100 ${
+                      alert.type === "critical" ? "bg-red-50" : "bg-yellow-50"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center">
+                        <div
+                          className={`w-3 h-3 rounded-full mr-3 ${
+                            alert.type === "critical"
+                              ? "bg-red-500"
+                              : "bg-yellow-500"
+                          }`}
+                        ></div>
+                        <div>
+                          <div
+                            className={`font-medium ${
+                              alert.type === "critical"
+                                ? "text-red-800"
+                                : "text-yellow-800"
+                            }`}
+                          >
+                            {alert.title}
+                          </div>
+                          <div
+                            className={`text-sm ${
+                              alert.type === "critical"
+                                ? "text-red-600"
+                                : "text-yellow-600"
+                            }`}
+                          >
+                            {alert.message}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        {new Date(alert.timestamp).toLocaleTimeString()}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Error Logs */}
         {errorLogs.length > 0 && (

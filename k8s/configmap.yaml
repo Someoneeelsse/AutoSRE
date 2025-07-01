@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autosre-config
+  namespace: autosre
+data:
+  NGINX_LOG_FORMAT: '$remote_addr - - [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
+  NGINX_ACCESS_LOG: /var/log/nginx/access.log
+  NGINX_ERROR_LOG: /var/log/nginx/error.log
